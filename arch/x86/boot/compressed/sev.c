@@ -13,6 +13,7 @@
 #include "misc.h"
 
 #include <asm/bootparam.h>
+#include <asm/e820/types.h>
 #include <asm/pgtable_types.h>
 #include <asm/sev.h>
 #include <asm/trapnr.h>
@@ -107,6 +108,19 @@ void snp_accept_memory(phys_addr_t start, phys_addr_t end)
 		__page_state_change(pa, pa, &d);
 }
 
+static void reserve_boot_ghcb_page(void)
+{
+	struct boot_e820_entry *entry;
+
+	if (boot_params_ptr->e820_entries >= ARRAY_SIZE(boot_params_ptr->e820_table))
+		error("No E820 entry available to reserve the boot GHCB page");
+
+	entry = &boot_params_ptr->e820_table[boot_params_ptr->e820_entries++];
+	entry->addr = __pa(&boot_ghcb_page);
+	entry->size = PAGE_SIZE;
+	entry->type = E820_TYPE_RESERVED;
+}
+
 void sev_es_shutdown_ghcb(void)
 {
 	if (!boot_ghcb)
@@ -124,6 +138,41 @@ void sev_es_shutdown_ghcb(void)
 	 * page.
 	 */
 	boot_ghcb = NULL;
+
+	if (sev_snp_enabled()) {
+		/*
+		 * MSHV implements the registered GHCB GPA as an overlay. It does
+		 * not release the overlay from the current page when the guest
+		 * merely stops using that GHCB, so the page-state change below
+		 * cannot make the decompressor GHCB private again. The runtime
+		 * kernel registers a new GHCB almost immediately, which moves the
+		 * overlay, but by then this decompressor code no longer owns the
+		 * old page and cannot safely return it to private memory.
+		 *
+		 * The proper long-term solution is an explicit GHCB unregister
+		 * operation. The guest should issue that operation before asking
+		 * to make the old GHCB private, and the corresponding host
+		 * implementation must remove the GHCB overlay from the registered
+		 * GPA and acknowledge the unregister only after the page is
+		 * released. In particular, merely clearing the SevGhcbGpa valid
+		 * bit is insufficient on a host that retains the overlay until a
+		 * replacement GPA is installed. Once that guest/host protocol is
+		 * available, this reserved shared-page workaround should be
+		 * removed.
+		 *
+		 * Until then, scrub the page and deliberately leak it as shared.
+		 * Add an overlapping E820 reserved entry so the running kernel
+		 * excludes this exact page from RAM; the normal E820 sanitizer
+		 * resolves the overlap in favor of the reserved type.
+		 */
+		memset(&boot_ghcb_page, 0, sizeof(boot_ghcb_page));
+		reserve_boot_ghcb_page();
+
+		if (set_page_non_present((unsigned long)&boot_ghcb_page))
+			error("Can't unmap leaked GHCB page");
+
+		return;
+	}
 
 	/*
 	 * GHCB Page must be flushed from the cache and mapped encrypted again.
